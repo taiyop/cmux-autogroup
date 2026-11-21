@@ -4,33 +4,38 @@
 
 Automatically organize [cmux](https://cmux.com/) workspaces into sidebar **Workspace Groups** by Git repository root whenever you open a workspace or `cd` into a repository.
 
+Supports **Zsh**, **Bash**, and **Fish** via a shared core (`bin/cmux-autogroup`) and thin shell wrappers.
+
 ## Features
 
+- **Multi-shell support**: Works in Zsh, Bash (3.2+), and Fish with a single shared core and lightweight shell hooks.
 - **Zero extra anchor tabs**: Creates each repository group using your current workspace (`--from "$CMUX_WORKSPACE_ID"`) instead of spawning an extra empty anchor workspace.
 - **Seamless switching between repositories**: When moving out of a group whose **anchor** is the current workspace:
   - If other workspaces remain in that group, transfers anchor ownership via `cmux workspace-group set-anchor` so the old group stays intact.
   - If it was the only workspace in the group, dissolves the old group via `cmux workspace-group ungroup` without closing your workspace.
   - Pinned empty groups are protected and left untouched.
 - **Idempotent & window-scoped**: Uses `--idempotency-key "repo:<canonical-path>"` and `--id-format both` so multiple workspaces in the same repo cleanly join the same group.
-- **Lightweight**: Runs once on shell startup (self-removing `precmd` hook) and on directory changes (`chpwd`), caching `$PWD` so `git` is not invoked on every prompt.
+- **Lightweight**: Each shell wrapper caches `$PWD` in-process, so no subprocess is spawned on prompts when your directory has not changed.
 - **No-op outside cmux**: Immediately exits when `CMUX_WORKSPACE_ID` is unset.
 
 ## Requirements
 
 - [cmux](https://cmux.com/) with `workspace-group` CLI and `--id-format both` support (tested on `cmux 0.65.2`)
-- `zsh`
+- `bash` (3.2+, pre-installed on macOS/Linux) for the shared core
 - `git`
 - `jq` (pre-installed on macOS 15+, or `brew install jq`)
 
 ## Installation
 
-### Manual (`~/.zshrc`)
+First, clone the repository:
 
-```zsh
+```sh
 git clone https://github.com/taiyop/cmux-autogroup.git ~/.config/cmux/cmux-autogroup
 ```
 
-Add the following near the end of your `~/.zshrc` (after `PATH` setup):
+### Zsh
+
+Add near the end of `~/.zshrc` (after `PATH` setup):
 
 ```zsh
 if [[ -n "${CMUX_WORKSPACE_ID:-}" && -r "$HOME/.config/cmux/cmux-autogroup/cmux-autogroup.plugin.zsh" ]]; then
@@ -39,37 +44,41 @@ if [[ -n "${CMUX_WORKSPACE_ID:-}" && -r "$HOME/.config/cmux/cmux-autogroup/cmux-
 fi
 ```
 
-### Sheldon
+Or use your Zsh plugin manager:
+- **Sheldon**:
+  ```toml
+  [plugins.cmux-autogroup]
+  github = "taiyop/cmux-autogroup"
+  ```
+- **zinit**: `zinit light taiyop/cmux-autogroup`
+- **antidote**: `taiyop/cmux-autogroup`
+- **Oh My Zsh**: clone into `${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/cmux-autogroup` and add `cmux-autogroup` to `plugins=(...)`
 
-```toml
-[plugins.cmux-autogroup]
-github = "taiyop/cmux-autogroup"
+### Bash
+
+Add near the end of `~/.bashrc` (or `~/.bash_profile`):
+
+```bash
+if [[ -n "${CMUX_WORKSPACE_ID:-}" && -r "$HOME/.config/cmux/cmux-autogroup/init/cmux-autogroup.bash" ]]; then
+  export CMUX_GROUP_BASE="$HOME/Projects"
+  source "$HOME/.config/cmux/cmux-autogroup/init/cmux-autogroup.bash"
+fi
 ```
 
-### zinit
+### Fish
 
-```zsh
-zinit light taiyop/cmux-autogroup
+Add to `~/.config/fish/config.fish`:
+
+```fish
+if set -q CMUX_WORKSPACE_ID; and test -r "$HOME/.config/cmux/cmux-autogroup/init/cmux-autogroup.fish"
+    set -gx CMUX_GROUP_BASE "$HOME/Projects"
+    source "$HOME/.config/cmux/cmux-autogroup/init/cmux-autogroup.fish"
+end
 ```
-
-### antidote
-
-```text
-taiyop/cmux-autogroup
-```
-
-### Oh My Zsh
-
-```zsh
-git clone https://github.com/taiyop/cmux-autogroup.git \
-  "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/cmux-autogroup"
-```
-
-Then add `cmux-autogroup` to `plugins=(...)` in `~/.zshrc`.
 
 ## Configuration
 
-Set these environment variables **before** sourcing `cmux-autogroup.plugin.zsh`:
+Set these environment variables **before** sourcing the hook:
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -77,6 +86,17 @@ Set these environment variables **before** sourcing `cmux-autogroup.plugin.zsh`:
 | `CMUX_GROUP_WORKTREE_MODE` | `separate` | `separate`: one group per git worktree (`--show-toplevel`). `shared`: bundle worktrees into their main repository's group (`--git-common-dir`). |
 | `CMUX_GROUP_NAME_MODE` | `basename` | `basename`: use the repository folder name (e.g. `app`). `relative`: use the path relative to the matched `CMUX_GROUP_BASE` (e.g. `team/app`) to disambiguate same-named repos. |
 | `CMUX_AUTO_GROUP_DEBUG` | `0` | Set to `1` to print error/skip diagnostics to `stderr`. |
+
+## Architecture
+
+```text
+cmux-autogroup/
+├── bin/cmux-autogroup          # Shared core (Bash 3.2+ compatible)
+├── cmux-autogroup.plugin.zsh   # Zsh wrapper (chpwd + one-shot precmd)
+├── init/cmux-autogroup.bash    # Bash wrapper (PROMPT_COMMAND)
+├── init/cmux-autogroup.fish    # Fish wrapper (--on-variable PWD)
+└── tests/run_tests.bash        # Mock-based core + shell wrapper test suite
+```
 
 ## Usage & Tips
 
@@ -89,8 +109,8 @@ Set these environment variables **before** sourcing `cmux-autogroup.plugin.zsh`:
 
 Run the mock-based test suite (no running cmux instance required):
 
-```zsh
-zsh tests/test_autogroup.zsh
+```sh
+bash tests/run_tests.bash
 ```
 
 ## License
