@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# cmux-autogroup core executable (Bash 3.2+ compatible)
+# Automatically groups the current cmux workspace by git repository root.
+# https://github.com/taiyop/cmux-autogroup
+#
+# Protocol with shell wrappers:
+#   - Logs diagnostics to stderr only (when CMUX_AUTO_GROUP_DEBUG=1).
+#   - Prints the canonical repository path to stdout ONLY when membership is
+#     confirmed/updated, so the calling shell can cache _CMUX_LAST_GROUP_REPO.
+#   - Always exits 0 on normal skips/soft errors so interactive prompts and
+#     `set -e` shells are never disrupted.
+
+set -uo pipefail
+
+_log() {
+  if [[ "${CMUX_AUTO_GROUP_DEBUG:-0}" == "1" ]]; then
+    printf '[cmux-autogroup] %s\n' "$*" >&2
+  fi
+}
+
+_to_lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+_expand_tilde() {
+  local p="$1"
+  if [[ "$p" == "~" ]]; then
+    printf '%s' "$HOME"
+  elif [[ "$p" == "~/"* ]]; then
+    printf '%s' "$HOME/${p#\~/}"
+  else
+    printf '%s' "$p"
+  fi
+}
+
+_resolve_dir() {
+  local p="$1"
+  if [[ -d "$p" ]]; then
+    (cd -P -- "$p" 2>/dev/null && pwd -P) || printf '%s' "$p"
+  else
+    printf '%s' "$p"
+  fi
+}
+
+# Release current workspace if it is the anchor of a different group.
+# Returns 0 if released (or not an anchor of another group), 1 if blocked.
+_release_if_other_anchor() {
+  local ws_lower="$1"
+  local target_group_lower="$2"
+  local list_json="$3"
+
+  local anchor_info
+  anchor_info=$(printf '%s' "$list_json" | jq -r --arg ws "$ws_lower" '
+    first(
+      (.groups // .)[]
+      | select((.anchor_workspace_id // "" | ascii_downcase) == $ws)
+    ) // empty
+    | [
+        (.id // .group_id // .ref // .group_ref // ""),
+        ((.member_workspace_ids // []) | map(select(ascii_downcase != $ws)) | .[0] // ""),
+        ((.is_pinned // .pinned // false) | tostring)
+      ]
+    | join("\n")
+  ' 2>/dev/null) || return 0
+
+  [[ -n "$anchor_info" ]] || return 0
+
+  local old_group="" next_member="" is_pinned="false"
+  {
+    IFS= read -r old_group
+    IFS= read -r next_member
+    IFS= read -r is_pinned
+  } <<< "$anchor_info"
+
+  local old_group_lower
+  old_group_lower="$(_to_lower "$old_group")"
+
+  if [[ -n "$target_group_lower" && "$old_group_lower" == "$target_group_lower" ]]; then
+    return 0
+  fi
+
+  local err
+  if [[ -n "$next_member" ]]; then
+    if ! err=$(cmux workspace-group set-anchor \
+      --group "$old_group" \
+      --workspace "$next_member" 2>&1 >/dev/null); then
+      _log "set-anchor failed: $err"
+      return 1
+    fi
+  elif [[ "$is_pinned" == "true" ]]; then
+    _log "skip moving anchor of pinned empty group: $old_group"
+    return 1
+  else
+    if ! err=$(cmux workspace-group ungroup "$old_group" 2>&1 >/dev/null); then
+      _log "ungroup failed: $err"
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+main() {
+  local target_dir="${1:-$PWD}"
+  if [[ "$target_dir" == "sync" ]]; then
+    target_dir="${2:-$PWD}"
+  fi
+
+  [[ -n "${CMUX_WORKSPACE_ID:-}" ]] || return 0
+  command -v cmux >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && command -v git >/dev/null 2>&1 || return 0
+  [[ -d "$target_dir" ]] || return 0
+
+  local worktree_mode="${CMUX_GROUP_WORKTREE_MODE:-separate}"
+  local name_mode="${CMUX_GROUP_NAME_MODE:-basename}"
+  local group_base
+  if [[ "${CMUX_GROUP_BASE+set}" == "set" ]]; then
+    group_base="$CMUX_GROUP_BASE"
+  else
+    group_base="$HOME/Projects"
+  fi
+
+  local repo=""
+  if [[ "$worktree_mode" == "shared" ]]; then
+    local common_dir
+    common_dir=$(git -C "$target_dir" rev-parse --git-common-dir 2>/dev/null) || return 0
+    if [[ "$common_dir" != /* ]]; then
+      common_dir="$target_dir/$common_dir"
+    fi
+    common_dir="$(_resolve_dir "$common_dir")"
+    if [[ "${common_dir##*/}" == ".git" ]]; then
+      repo="${common_dir%/*}"
+    else
+      repo="$common_dir"
+    fi
+  else
+    repo=$(git -C "$target_dir" rev-parse --show-toplevel 2>/dev/null) || return 0
+  fi
+
+  repo="$(_resolve_dir "$repo")"
+  [[ -n "$repo" ]] || return 0
+
+  # Filter by CMUX_GROUP_BASE (empty or "*" matches all repositories).
+  local matched_base=""
+  if [[ -z "$group_base" || "$group_base" == "*" ]]; then
+    matched_base="/"
+  else
+    local remaining="$group_base"
+    local raw_base resolved_base
+    while :; do
+      if [[ "$remaining" == *:* ]]; then
+        raw_base="${remaining%%:*}"
+        remaining="${remaining#*:}"
+      else
+        raw_base="$remaining"
+        remaining=""
+      fi
+      if [[ -n "$raw_base" ]]; then
+        resolved_base="$(_resolve_dir "$(_expand_tilde "$raw_base")")"
+        if [[ -n "$resolved_base" && ( "$repo" == "$resolved_base" || "$repo" == "$resolved_base/"* ) ]]; then
+          matched_base="$resolved_base"
+          break
+        fi
+      fi
+      [[ -n "$remaining" ]] || break
+    done
+    [[ -n "$matched_base" ]] || return 0
+  fi
+
+  # Skip if caller already synced to this repository.
+  if [[ "${_CMUX_LAST_GROUP_REPO:-}" == "$repo" ]]; then
+    return 0
+  fi
+
+  local group_name="${repo##*/}"
+  if [[ "$name_mode" == "relative" && "$matched_base" != "/" && "$repo" == "$matched_base/"* ]]; then
+    group_name="${repo#"$matched_base/"}"
+  fi
+
+  local ws_lower
+  ws_lower="$(_to_lower "$CMUX_WORKSPACE_ID")"
+  local key="repo:$repo"
+  local list_json existing_group create_out target_group err
+
+  list_json=$(cmux --id-format both workspace-group list --json 2>/dev/null) || {
+    _log "workspace-group list failed"
+    return 0
+  }
+
+  existing_group=$(printf '%s' "$list_json" | jq -r --arg key "$key" '
+    first(
+      (.groups // .)[]
+      | select((.idempotency_key // .external_id // "") == $key)
+      | (.id // .group_id // .ref // .group_ref // "")
+    ) // empty
+  ' 2>/dev/null)
+
+  if [[ -n "$existing_group" ]]; then
+    local existing_lower
+    existing_lower="$(_to_lower "$existing_group")"
+
+    if printf '%s' "$list_json" | jq -e --arg ws "$ws_lower" --arg tg "$existing_lower" '
+      (.groups // .)[]
+      | select(
+          ((.id // .group_id // "") | ascii_downcase) == $tg
+          or ((.ref // .group_ref // "") | ascii_downcase) == $tg
+        )
+      | ((.anchor_workspace_id // "" | ascii_downcase) == $ws)
+        or (((.member_workspace_ids // []) | map(ascii_downcase) | index($ws)) != null)
+    ' >/dev/null 2>&1; then
+      printf '%s\n' "$repo"
+      return 0
+    fi
+
+    _release_if_other_anchor "$ws_lower" "$existing_lower" "$list_json" || return 0
+
+    if err=$(cmux workspace-group add \
+      --group "$existing_group" \
+      --workspace "$CMUX_WORKSPACE_ID" 2>&1 >/dev/null); then
+      printf '%s\n' "$repo"
+    else
+      _log "add failed: $err"
+    fi
+    return 0
+  fi
+
+  # No group exists yet: release old anchor if needed, then create with --from current workspace.
+  _release_if_other_anchor "$ws_lower" "" "$list_json" || return 0
+
+  if ! create_out=$(cmux --id-format both workspace-group create --json \
+    --name "$group_name" \
+    --cwd "$repo" \
+    --from "$CMUX_WORKSPACE_ID" \
+    --idempotency-key "$key" 2>&1); then
+    _log "create failed: $create_out"
+    return 0
+  fi
+
+  target_group=$(printf '%s' "$create_out" | jq -r '
+    .id // .group_id // .ref // .group_ref
+    // .group.id // .group.group_id // .group.ref // .group.group_ref
+    // empty
+  ' 2>/dev/null)
+  if [[ -z "$target_group" ]]; then
+    local ref_re='workspace_group:[0-9]+'
+    if [[ "$create_out" =~ $ref_re ]]; then
+      target_group="${BASH_REMATCH[0]}"
+    fi
+  fi
+  if [[ -z "$target_group" ]]; then
+    _log "could not parse target group from: $create_out"
+    return 0
+  fi
+
+  # Verify membership (handles rare concurrent create returning an existing group).
+  list_json=$(cmux --id-format both workspace-group list --json 2>/dev/null) || {
+    printf '%s\n' "$repo"
+    return 0
+  }
+
+  local target_lower
+  target_lower="$(_to_lower "$target_group")"
+  if printf '%s' "$list_json" | jq -e --arg ws "$ws_lower" --arg tg "$target_lower" '
+    (.groups // .)[]
+    | select(
+        ((.id // .group_id // "") | ascii_downcase) == $tg
+        or ((.ref // .group_ref // "") | ascii_downcase) == $tg
+      )
+    | ((.anchor_workspace_id // "" | ascii_downcase) == $ws)
+      or (((.member_workspace_ids // []) | map(ascii_downcase) | index($ws)) != null)
+  ' >/dev/null 2>&1; then
+    printf '%s\n' "$repo"
+    return 0
+  fi
+
+  if err=$(cmux workspace-group add \
+    --group "$target_group" \
+    --workspace "$CMUX_WORKSPACE_ID" 2>&1 >/dev/null); then
+    printf '%s\n' "$repo"
+  else
+    _log "add after create failed: $err"
+  fi
+}
+
+main "$@"
