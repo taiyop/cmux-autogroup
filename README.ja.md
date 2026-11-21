@@ -1,0 +1,81 @@
+# cmux-autogroup
+
+[English](README.md)
+
+[cmux](https://cmux.com/) で Git リポジトリのルート単位に **Workspace Group** を自動で作成・切り替えする Zsh プラグインです。
+
+## 特徴
+
+- **余分な空アンカー Workspace を増やさない**: 現在の Workspace をアンカーにしてグループを作成（`--from "$CMUX_WORKSPACE_ID"`）するため、初回移動時に空タブが増えません。
+- **別リポジトリ移動時のアンカー制約を自動解決**: 現在の Workspace が旧グループのアンカーになっていても、以下のように自動で処理します。
+  - 旧グループに他メンバーが残っている場合：`cmux workspace-group set-anchor` でアンカー権限を移譲してから移動（旧グループを維持）
+  - 自分だけのグループだった場合：`cmux workspace-group ungroup` で旧グループを解散してから移動（Workspace 自体は閉じない）
+  - ピン留めされた空グループは勝手に消さず保護してスキップ
+- **冪等なグルーピング**: `--idempotency-key "repo:<正規化パス>"` と `--id-format both` により、同じリポジトリの複数 Workspace を確実に同一グループへまとめます。
+- **軽量設計**: 起動時の初回プロンプト（1回だけ実行して自動解除）と `chpwd` のみで動作し、`$PWD` キャッシュにより毎プロンプトでの `git` 実行を避けます。
+- **cmux 外では完全 no-op**: `CMUX_WORKSPACE_ID` が無いターミナルではフック登録すらせずに終了します。
+
+## 動作要件
+
+- `workspace-group` サブコマンドおよび `--id-format both` に対応した [cmux](https://cmux.com/)（`0.65.2` で動作確認）
+- `zsh`
+- `git`
+- `jq`（macOS 15+ は標準搭載、未導入の場合は `brew install jq`）
+
+## インストール
+
+### 手動導入（`~/.zshrc`）
+
+```zsh
+git clone https://github.com/taiyop/cmux-autogroup.git ~/.config/cmux/cmux-autogroup
+```
+
+`~/.zshrc` の末尾付近（`PATH` 設定の後）に以下を追記します：
+
+```zsh
+if [[ -n "${CMUX_WORKSPACE_ID:-}" && -r "$HOME/.config/cmux/cmux-autogroup/cmux-autogroup.plugin.zsh" ]]; then
+  export CMUX_GROUP_BASE="$HOME/repos"
+  source "$HOME/.config/cmux/cmux-autogroup/cmux-autogroup.plugin.zsh"
+fi
+```
+
+### プラグインマネージャ
+
+- **Sheldon**:
+  ```toml
+  [plugins.cmux-autogroup]
+  github = "taiyop/cmux-autogroup"
+  ```
+- **zinit**: `zinit light taiyop/cmux-autogroup`
+- **antidote**: `taiyop/cmux-autogroup`
+- **Oh My Zsh**: `${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/cmux-autogroup` に clone して `plugins=(... cmux-autogroup)` に追加
+
+## 設定オプション
+
+`cmux-autogroup.plugin.zsh` を読み込む**前**に環境変数で指定できます。
+
+| 環境変数 | デフォルト | 説明 |
+| --- | --- | --- |
+| `CMUX_GROUP_BASE` | `$HOME/Projects` | 自動グループ化の対象ディレクトリ。`:` 区切りで複数指定可能（例: `"$HOME/repos:$HOME/work"`）。空文字 `""` または `"*"` で全 Git リポジトリを対象にします。 |
+| `CMUX_GROUP_WORKTREE_MODE` | `separate` | `separate`: worktree ごとに別グループ（`--show-toplevel`）。`shared`: worktree を親リポジトリのグループに統合（`--git-common-dir`）。 |
+| `CMUX_GROUP_NAME_MODE` | `basename` | `basename`: リポジトリ末尾名（例: `app`）。`relative`: `CMUX_GROUP_BASE` からの相対パス（例: `team/app`）で同名リポジトリを区別。 |
+| `CMUX_AUTO_GROUP_DEBUG` | `0` | `1` にするとエラーやスキップ理由を `stderr` に出力します。 |
+
+## 運用メモ
+
+- **`⌘N`（New Workspace）**: cmux 標準の `workspaceInheritWorkingDirectory: true` により、同じリポジトリ配下（サブディレクトリ含む）で `⌘N` を押すと自動的に同じリポジトリのグループに入ります。
+- **手動再同期**: `cmux-autogroup-sync`（デバッグ時は `CMUX_AUTO_GROUP_DEBUG=1 cmux-autogroup-sync`）でキャッシュを無視して再評価できます。
+- **複数ペイン**: `CMUX_WORKSPACE_ID` は Workspace 全体で共通のため、別ペインで別リポジトリに `cd` すると Workspace 全体が移動します。
+- **別ウィンドウ（`⌘⇧N`）**: cmux の Workspace Group はウィンドウ単位のため、別ウィンドウ側で独立したグループが作成されます。
+
+## テスト
+
+モックを使った自動テスト（cmux 本体の起動不要）：
+
+```zsh
+zsh tests/test_autogroup.zsh
+```
+
+## ライセンス
+
+[MIT](LICENSE)
