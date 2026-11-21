@@ -16,10 +16,14 @@ jobs:
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zsh jq git
+        run: sudo apt-get update && sudo apt-get install -y bash zsh fish jq git
 
-      - name: Check zsh syntax
-        run: zsh -n cmux-autogroup.plugin.zsh
+      - name: Check syntax across shells
+        run: |
+          bash -n bin/cmux-autogroup
+          bash -n init/cmux-autogroup.bash
+          zsh -n cmux-autogroup.plugin.zsh
+          if command -v fish >/dev/null 2>&1; then fish -n init/cmux-autogroup.fish; fi
 
-      - name: Run unit tests
-        run: zsh tests/test_autogroup.zsh
+      - name: Run unit and wrapper tests
+        run: bash tests/run_tests.bash
